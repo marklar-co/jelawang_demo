@@ -11,7 +11,7 @@ import urllib.request
 from dataclasses import dataclass
 
 try:
-    from agents import Agent, Runner, function_tool
+    from agents import Agent, ModelSettings, Runner, function_tool
 except ImportError as exc:  # pragma: no cover - startup guard
     raise SystemExit(
         "The OpenAI Agents SDK is not installed. Run: pip install -r requirements.txt"
@@ -171,6 +171,7 @@ async def main() -> int:
             "open the requested issue, transition it to the requested status, and verify the final status. "
             "Keep the final answer to one concise sentence with the issue key and final status."
         ),
+        model_settings=ModelSettings(parallel_tool_calls=False),
         tools=[
             reset_fake_jira,
             open_fake_jira,

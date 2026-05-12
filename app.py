@@ -1,14 +1,72 @@
 # app.py
+from __future__ import annotations
+
+import os
 from copy import deepcopy
+from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-app = FastAPI()
+from blameless import normalize_transcript_for_postmortem
+from browser_demo import run_jira_browser_search
+from demo_pages import FAKE_JIRA_HTML as FAKE_JIRA_PAGE
+from demo_pages import MEETING_DEMO_HTML
+from meeting_agents import (
+    describe_agents,
+    evaluate_blameless_agent_guardrails,
+    run_task_draft_agent_with_guardrails,
+)
+from meeting_logic import (
+    DemoState,
+    extract_topics,
+    process_transcript_line,
+    reset_state,
+    search_jira_issues,
+)
+from transcript_demo import TRANSCRIPT
+
+app = FastAPI(title="Meeting-to-Jira Agent Demo")
 
 
 ISSUE_SEED = [
+    {
+        "key": "AUTH-231",
+        "summary": "Websocket reconnect fails when auth token expires",
+        "description": (
+            "Regression coverage for token refresh during websocket session reconnect "
+            "and multi-tab refresh."
+        ),
+        "status": "In Progress",
+        "assignee": "Bob",
+        "priority": "High",
+        "labels": ["auth", "websocket", "reconnect", "regression", "token refresh"],
+    },
+    {
+        "key": "AUTH-198",
+        "summary": "Token refresh middleware misses cache invalidation",
+        "description": (
+            "Ensure auth middleware coordinates Redis cache invalidation across tabs "
+            "during refresh."
+        ),
+        "status": "To Do",
+        "assignee": "Alice",
+        "priority": "Medium",
+        "labels": ["auth", "middleware", "Redis", "cache invalidation"],
+    },
+    {
+        "key": "WEB-77",
+        "summary": "Add retry telemetry for websocket gateway reconnects",
+        "description": (
+            "Track retry counts, reconnect timing, and gateway failures when Redis is "
+            "briefly unavailable."
+        ),
+        "status": "To Do",
+        "assignee": "Unassigned",
+        "priority": "Medium",
+        "labels": ["websocket", "retry", "telemetry", "Redis"],
+    },
     {
         "key": "JEL-101",
         "summary": "Create customer CSV import preview",
@@ -39,30 +97,85 @@ ISSUE_SEED = [
 ]
 
 VALID_STATUSES = {"To Do", "In Progress", "Done"}
-issues = {issue["key"]: deepcopy(issue) for issue in ISSUE_SEED}
+issues: dict[str, dict[str, Any]] = {issue["key"]: deepcopy(issue) for issue in ISSUE_SEED}
+meeting_state: DemoState = reset_state()
+created_issue_counter = 300
 
 
 class TransitionRequest(BaseModel):
     status: str
 
 
-@app.get("/")
-def root():
-    return {"hello": "world", "fake_jira": "/jira"}
+class CreateIssueRequest(BaseModel):
+    summary: str
+    description: str = ""
+    assignee: str = "Unassigned"
+    priority: str = "Medium"
+    labels: list[str] = Field(default_factory=list)
+
+
+class AgentGuardrailRequest(BaseModel):
+    text: str
+
+
+@app.get("/", response_class=HTMLResponse)
+def meeting_demo() -> HTMLResponse:
+    return HTMLResponse(MEETING_DEMO_HTML)
 
 
 @app.get("/jira", response_class=HTMLResponse)
-def fake_jira():
-    return HTMLResponse(FAKE_JIRA_HTML)
+def fake_jira() -> HTMLResponse:
+    return HTMLResponse(FAKE_JIRA_PAGE)
+
+
+@app.get("/jira/create", response_class=HTMLResponse)
+def fake_jira_create() -> HTMLResponse:
+    return HTMLResponse(FAKE_JIRA_PAGE)
 
 
 @app.get("/api/issues")
-def list_issues():
-    return {"issues": list(issues.values())}
+def list_issues(q: str | None = Query(default=None), query: str | None = Query(default=None)) -> dict[str, Any]:
+    search_text = q or query
+    issue_values = list(issues.values())
+    if search_text:
+        topics = extract_topics(search_text)
+        related = search_jira_issues(search_text, topics, issue_values, limit=len(issue_values))
+        issue_values = [issues[issue.key] for issue in related]
+    return {"issues": issue_values}
+
+
+@app.get("/api/search")
+def search_issues(q: str = Query(..., min_length=1)) -> dict[str, Any]:
+    return list_issues(q=q)
+
+
+@app.post("/api/issues")
+def create_issue(request: CreateIssueRequest) -> dict[str, Any]:
+    global created_issue_counter
+
+    summary_guardrail = normalize_transcript_for_postmortem(request.summary)
+    description_guardrail = normalize_transcript_for_postmortem(request.description)
+    normalized_summary = summary_guardrail["normalized_transcript"]
+    normalized_description = description_guardrail["normalized_transcript"]
+    guardrail_response = _combine_guardrails(summary_guardrail, description_guardrail)
+
+    created_issue_counter += 1
+    key = f"DEMO-{created_issue_counter}"
+    issue = {
+        "key": key,
+        "summary": normalized_summary,
+        "description": normalized_description,
+        "status": "To Do",
+        "assignee": request.assignee,
+        "priority": request.priority,
+        "labels": request.labels,
+    }
+    issues[key] = issue
+    return {**issue, "blameless_guardrail": guardrail_response}
 
 
 @app.get("/api/issues/{issue_key}")
-def get_issue(issue_key: str):
+def get_issue(issue_key: str) -> dict[str, Any]:
     issue = issues.get(issue_key)
     if issue is None:
         raise HTTPException(status_code=404, detail="Issue not found")
@@ -70,7 +183,7 @@ def get_issue(issue_key: str):
 
 
 @app.post("/api/issues/{issue_key}/transition")
-def transition_issue(issue_key: str, request: TransitionRequest):
+def transition_issue(issue_key: str, request: TransitionRequest) -> dict[str, Any]:
     issue = issues.get(issue_key)
     if issue is None:
         raise HTTPException(status_code=404, detail="Issue not found")
@@ -82,13 +195,140 @@ def transition_issue(issue_key: str, request: TransitionRequest):
 
 
 @app.post("/api/reset")
-def reset_demo():
+def reset_jira() -> dict[str, Any]:
+    global created_issue_counter
+
     issues.clear()
     issues.update({issue["key"]: deepcopy(issue) for issue in ISSUE_SEED})
+    created_issue_counter = 300
     return {"issues": list(issues.values())}
 
 
-FAKE_JIRA_HTML = """
+@app.post("/meeting/reset")
+def reset_meeting() -> dict[str, Any]:
+    global meeting_state
+
+    meeting_state = reset_state()
+    return _state_payload()
+
+
+@app.get("/meeting/state")
+def get_meeting_state() -> dict[str, Any]:
+    return _state_payload()
+
+
+@app.get("/meeting/next")
+def next_transcript_chunk() -> dict[str, Any]:
+    global meeting_state
+
+    index = meeting_state.current_transcript_index
+    if index >= len(TRANSCRIPT):
+        return {"done": True, "state": _state_payload()}
+
+    step = process_transcript_line(index, TRANSCRIPT[index], list(issues.values()))
+    meeting_state.last_transcript_line = step.transcript_line
+    meeting_state.current_transcript_index = step.index + 1
+    meeting_state.history.append(step)
+
+    seen_keys = {issue.key for issue in meeting_state.surfaced_jira_issues}
+    for issue in step.related_jira_issues:
+        if issue.key not in seen_keys:
+            meeting_state.surfaced_jira_issues.append(issue)
+            seen_keys.add(issue.key)
+
+    if step.task_draft:
+        meeting_state.generated_task_drafts.append(step.task_draft)
+    if step.blameless_note:
+        meeting_state.blameless_warnings.append(step.blameless_note)
+        meeting_state.generated_task_drafts.append(step.blameless_note.prevention_task)
+
+    return {
+        "done": False,
+        "raw_transcript": step.raw_transcript,
+        "normalized_transcript": step.normalized_transcript,
+        "blameless_guardrail": step.blameless_guardrail.model_dump(),
+        "step": step.model_dump(),
+        "state": _state_payload(),
+    }
+
+
+@app.get("/browser-demo/search")
+async def browser_demo_search(
+    request: Request,
+    q: str = Query(..., min_length=1),
+    open_top: bool = True,
+) -> dict[str, Any]:
+    base_url = str(request.base_url).rstrip("/")
+    browser_result = await run_jira_browser_search(base_url, q, open_top=open_top)
+    topics = extract_topics(q)
+    related = search_jira_issues(q, topics, list(issues.values()))
+    return {
+        **browser_result,
+        "deterministic_matches": [issue.model_dump() for issue in related],
+    }
+
+
+@app.get("/meeting/agents")
+def meeting_agents() -> dict[str, object]:
+    return describe_agents()
+
+
+@app.post("/meeting/agents/guardrail")
+def evaluate_agent_guardrails(request: AgentGuardrailRequest) -> dict[str, Any]:
+    return evaluate_blameless_agent_guardrails(request.text)
+
+
+@app.post("/meeting/agents/task-draft")
+async def guarded_agent_task_draft(request: AgentGuardrailRequest) -> dict[str, Any]:
+    guardrail_evaluation = evaluate_blameless_agent_guardrails(request.text)
+    if not os.getenv("OPENAI_API_KEY"):
+        normalized = guardrail_evaluation["input_guardrail"]["output_info"]
+        return {
+            "used_openai_agent": False,
+            "reason": "OPENAI_API_KEY is not set; returned the deterministic guardrail result.",
+            "final_output": normalized["normalized_transcript"],
+            "input_rewritten": normalized["blameless_guardrail"]["triggered"],
+            "output_rewritten": False,
+            "blameless_guardrail": normalized["blameless_guardrail"],
+            "guardrail_evaluation": guardrail_evaluation,
+        }
+
+    agent_result = await run_task_draft_agent_with_guardrails(request.text)
+    return {**agent_result, "guardrail_evaluation": guardrail_evaluation}
+
+
+def _state_payload() -> dict[str, Any]:
+    payload = meeting_state.model_dump()
+    payload["total_transcript_lines"] = len(TRANSCRIPT)
+    return payload
+
+
+def _combine_guardrails(*guardrails: dict[str, Any]) -> dict[str, Any]:
+    triggered = any(item["blameless_guardrail"]["triggered"] for item in guardrails)
+    issues = [
+        issue
+        for item in guardrails
+        for issue in item["blameless_guardrail"]["issues"]
+    ]
+    rewrites = [
+        item["normalized_transcript"]
+        for item in guardrails
+        if item["blameless_guardrail"]["triggered"]
+    ]
+    prevention_tasks = [
+        item["blameless_guardrail"]["prevention_task"]
+        for item in guardrails
+        if item["blameless_guardrail"]["prevention_task"]
+    ]
+    return {
+        "triggered": triggered,
+        "issues": issues,
+        "rewrite": "\n".join(rewrites),
+        "prevention_task": " ".join(prevention_tasks),
+    }
+
+
+_LEGACY_FAKE_JIRA_HTML = """
 <!doctype html>
 <html lang="en">
 <head>
